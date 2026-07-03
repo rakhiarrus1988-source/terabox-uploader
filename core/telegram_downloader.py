@@ -3,7 +3,6 @@ import time
 import asyncio
 import aiofiles
 from telethon import TelegramClient, functions, types
-from telethon.errors import FileMigrateError
 from config import settings
 
 class TelegramDownloader:
@@ -43,58 +42,36 @@ class TelegramDownloader:
                 return f"[{bar}] {percentage:.1f}%"
 
             try:
+                # Pre-allocate file size on disk
                 with open(download_path, 'wb') as f:
                     f.truncate(file_size)
 
-                # 512KB Chunk size alignment
+                # 512KB strict chunk size
                 chunk_size = 512 * 1024  
                 parts = []
                 current_offset = 0
                 while current_offset < file_size:
                     current_limit = min(chunk_size, file_size - current_offset)
-                    if current_limit % 4096 != 0 and current_offset + current_limit < file_size:
-                        current_limit = (current_limit // 4096) * 4096
                     parts.append((current_offset, current_limit))
-                    current_offset += current_limit
+                    current_offset += chunk_size
 
                 downloaded = 0
                 start_time = time.time()
                 
-                # Max 4 concurrent chunks
+                # 4 Max Concurrency Workers
                 semaphore = asyncio.Semaphore(4)
 
-                file_location = types.InputDocumentFileLocation(
-                    id=async_msg.document.id,
-                    access_hash=async_msg.document.access_hash,
-                    file_reference=async_msg.document.file_reference,
-                    thumb_size=''
-                )
-
-                export_client = self.client
-
                 async def download_chunk(offset, limit):
-                    nonlocal downloaded, export_client
+                    nonlocal downloaded
                     async with semaphore:
-                        try:
-                            result = await export_client(functions.upload.GetFileRequest(
-                                location=file_location,
-                                offset=offset,
-                                limit=limit
-                            ))
-                        except FileMigrateError as e:
-                            # Dono attributes ka fallback backup (.dc_id aur .dc)
-                            target_dc = getattr(e, 'dc_id', getattr(e, 'dc', None))
-                            print(f"\n🔄 File is on DC {target_dc}. Switching connection...")
-                            export_client = await self.client.get_input_client(target_dc)
-                            
-                            result = await export_client(functions.upload.GetFileRequest(
-                                location=file_location,
-                                offset=offset,
-                                limit=limit
-                            ))
+                        # Telethon native download logic with specific byte offsets
+                        chunk_data = await self.client.download_file(
+                            async_msg.document,
+                            offset=offset,
+                            limit=limit
+                        )
 
-                        if isinstance(result, types.upload.File):
-                            chunk_data = result.bytes
+                        if chunk_data:
                             async with aiofiles.open(download_path, 'r+b') as f:
                                 await f.seek(offset)
                                 await f.write(chunk_data)
@@ -109,16 +86,7 @@ class TelegramDownloader:
                             bar_str = get_progress_bar(percentage)
                             print(f'\r⏳ Parallel Download: {bar_str} | {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
 
-                # Pehle hi DC checking complete kar lena
-                try:
-                    await self.client(functions.upload.GetFileRequest(location=file_location, offset=0, limit=4096))
-                except FileMigrateError as e:
-                    target_dc = getattr(e, 'dc_id', getattr(e, 'dc', None))
-                    print(f"🎯 Auto-detected correct file server: DC {target_dc}. Migrating workers...")
-                    export_client = await self.client.get_input_client(target_dc)
-                except Exception:
-                    pass
-
+                # Run parallel workers smoothly
                 tasks = [download_chunk(offset, limit) for offset, limit in parts]
                 await asyncio.gather(*tasks)
 
