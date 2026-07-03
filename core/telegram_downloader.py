@@ -33,22 +33,20 @@ class TelegramDownloader:
             file_size = async_msg.file.size
             total_mb = file_size / (1024 * 1024)
             print(f"✅ Found! Size: {total_mb:.2f} MB")
-            print("⚡ Trying parallel download (8 chunks max concurrency)...")
+            print("⚡ Trying parallel download (4 chunks max concurrency)...")
 
             download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
 
-            # Progress Bar Function
             def get_progress_bar(percentage, bar_length=20):
                 filled_length = int(round(bar_length * percentage / 100))
                 bar = '█' * filled_length + '░' * (bar_length - filled_length)
                 return f"[{bar}] {percentage:.1f}%"
 
             try:
-                # Setup Empty File
                 with open(download_path, 'wb') as f:
                     f.truncate(file_size)
 
-                # 512KB perfect chunk alignment
+                # 512KB Chunk size alignment
                 chunk_size = 512 * 1024  
                 parts = []
                 current_offset = 0
@@ -61,7 +59,9 @@ class TelegramDownloader:
 
                 downloaded = 0
                 start_time = time.time()
-                semaphore = asyncio.Semaphore(8)
+                
+                # Max 4 concurrent chunks
+                semaphore = asyncio.Semaphore(4)
 
                 file_location = types.InputDocumentFileLocation(
                     id=async_msg.document.id,
@@ -70,25 +70,23 @@ class TelegramDownloader:
                     thumb_size=''
                 )
 
-                # --- CRITICAL DC MIGRATION FIX WITH CORRECT SCOPE ---
                 export_client = self.client
 
                 async def download_chunk(offset, limit):
-                    nonlocal downloaded, export_client  # Fixed: Nonlocal declaration placed at the absolute top of the scope
+                    nonlocal downloaded, export_client
                     async with semaphore:
                         try:
-                            # Correct DC client pool se request bhejenge
                             result = await export_client(functions.upload.GetFileRequest(
                                 location=file_location,
                                 offset=offset,
                                 limit=limit
                             ))
                         except FileMigrateError as e:
-                            print(f"\n🔄 File is on DC {e.dc}. Creating parallel connection pool for DC {e.dc}...")
-                            # Us specific DC ke liye background client connection open karna
-                            export_client = await self.client.get_input_client(e.dc)
+                            # Dono attributes ka fallback backup (.dc_id aur .dc)
+                            target_dc = getattr(e, 'dc_id', getattr(e, 'dc', None))
+                            print(f"\n🔄 File is on DC {target_dc}. Switching connection...")
+                            export_client = await self.client.get_input_client(target_dc)
                             
-                            # Sahi client milne ke baad chunk firse request karna
                             result = await export_client(functions.upload.GetFileRequest(
                                 location=file_location,
                                 offset=offset,
@@ -103,7 +101,6 @@ class TelegramDownloader:
                             
                             downloaded += len(chunk_data)
                             
-                            # Live UI updates
                             current_mb = downloaded / (1024 * 1024)
                             percentage = (downloaded / file_size) * 100
                             elapsed = time.time() - start_time
@@ -112,20 +109,20 @@ class TelegramDownloader:
                             bar_str = get_progress_bar(percentage)
                             print(f'\r⏳ Parallel Download: {bar_str} | {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
 
-                # Pehle check karne ke liye ek chhota sa 4KB test request bhejenge taaki DC error catch ho sake
+                # Pehle hi DC checking complete kar lena
                 try:
                     await self.client(functions.upload.GetFileRequest(location=file_location, offset=0, limit=4096))
                 except FileMigrateError as e:
-                    print(f"🎯 Auto-detected correct file server: DC {e.dc}. Migrating parallel workers...")
-                    export_client = await self.client.get_input_client(e.dc)
+                    target_dc = getattr(e, 'dc_id', getattr(e, 'dc', None))
+                    print(f"🎯 Auto-detected correct file server: DC {target_dc}. Migrating workers...")
+                    export_client = await self.client.get_input_client(target_dc)
                 except Exception:
-                    pass  # Baki normal error test loop handle kar lega
+                    pass
 
-                # Run parallel download tasks
                 tasks = [download_chunk(offset, limit) for offset, limit in parts]
                 await asyncio.gather(*tasks)
 
-                print()  # Line break for cleanup
+                print()
                 elapsed = time.time() - start_time
                 avg_speed = total_mb / elapsed if elapsed > 0 else 0
                 print(f"✅ Downloaded (Parallel): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
