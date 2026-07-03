@@ -12,7 +12,6 @@ class TelegramDownloader:
         self.client = None
 
     async def connect(self):
-        # Yahan hum client initialization ko optimize kar rahe hain taaki multithreading standard parameters se ho sake
         self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
         await self.client.start()
         print("✅ Connected to Telegram!")
@@ -37,24 +36,29 @@ class TelegramDownloader:
             download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
             start_time = time.time()
 
-            # Real-time progress function
+            # Real-time progress function with NoneType safe check
             def progress_callback(current, total):
+                # Agar Telethon total ko None bhejta hai, toh hum manual file_size use karenge
+                actual_total = total if total is not None else file_size
+                
                 current_mb = current / (1024 * 1024)
+                final_total_mb = actual_total / (1024 * 1024)
+                
                 elapsed = time.time() - start_time
                 speed_mbps = current_mb / elapsed if elapsed > 0 else 0
-                percent = (current / total) * 100
-                print(f'\r⏳ Downloading: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
+                
+                percent = (current / actual_total) * 100 if actual_total > 0 else 0
+                print(f'\r⏳ Downloading: [{percent:.1f}%] {current_mb:.1f}/{final_total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
 
             try:
-                # Telethon ka native client.download_file loop system jo ki completely stable hai
-                # Aur bina kisi crash ke background connection handle karta hai
+                # Telethon native download structure
                 await self.client.download_file(
                     async_msg.document,
                     file=download_path,
                     progress_callback=progress_callback
                 )
                 
-                print()  # Download over hone par line break
+                print()  # Line break after download finish
                 elapsed = time.time() - start_time
                 avg_speed = total_mb / elapsed if elapsed > 0 else 0
                 print(f"✅ Downloaded successfully: {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
