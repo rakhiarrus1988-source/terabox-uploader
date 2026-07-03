@@ -1,6 +1,7 @@
 import os
 import time
 import asyncio
+import aiofiles
 from telethon import TelegramClient, functions, types
 from config import settings
 
@@ -16,15 +17,6 @@ class TelegramDownloader:
         await self.client.start()
         print("✅ Connected to Telegram!")
         return self.client
-
-    async def _get_dc_client(self, dc_id):
-        """Colab High-Speed dynamic DC pipeline connection"""
-        if self.client.session.dc_id == dc_id:
-            return self.client
-        try:
-            return await self.client._get_client(dc_id)
-        except Exception:
-            return await self.client.create_exported_phone_connection(dc_id)
 
     async def download_file(self, filename):
         saved_messages = 'me'
@@ -46,17 +38,16 @@ class TelegramDownloader:
         
         print(f"✅ Found in DC {dc_id}! Size: {total_mb:.2f} MB")
         print("🚀 Igniting Colab Engine (In-Memory Ring Buffering via 8 Workers)...")
+        print("⏳ Establishing connection with Data Center server...", end='', flush=True)
 
         download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
         
-        # 8 Workers optimization for Google Colab Network Bandwidth
-        CHUNK_SIZE = 512 * 1024  # 512 KB (Maximum legal MTProto chunk)
-        MAX_PARALLEL_CHUNKS = 8  # Strictly locked to 8 workers as requested
+        CHUNK_SIZE = 512 * 1024  # Max allowed MTProto chunk size (512 KB)
+        MAX_PARALLEL_CHUNKS = 8  # Fixed 8 workers
 
-        # Memory Buffer Allocation to bypass Colab Disk I/O Bottleneck
+        # Memory Buffer Allocation to bypass disk write latency during download
         file_buffer = bytearray(file_size)
 
-        # Chunks distribution mapping
         chunks = []
         offset = 0
         while offset < file_size:
@@ -79,11 +70,17 @@ class TelegramDownloader:
             thumb_size=''
         )
 
-        # Worker logic: Direct raw memory insertion
+        # Instant progress layout init takki pata chale script download state me aa chuki hai
+        print(f'\r⚡ Colab Speed: [0.0%] 0.0/{total_mb:.1f} MB @ 0.0 MB/s', end='', flush=True)
+
         async def worker():
             nonlocal downloaded
             try:
-                dc_client = await self._get_dc_client(dc_id)
+                # Direct safe multi-DC connection routing
+                if self.client.session.dc_id == dc_id:
+                    dc_client = self.client
+                else:
+                    dc_client = await self.client._get_client(dc_id)
             except Exception:
                 dc_client = self.client
 
@@ -94,7 +91,7 @@ class TelegramDownloader:
                     break
 
                 success = False
-                for attempt in range(5):  # Network spike retry limit
+                for attempt in range(5):  # Retry mechanics
                     try:
                         result = await dc_client(functions.upload.GetFileRequest(
                             location=file_location,
@@ -103,29 +100,27 @@ class TelegramDownloader:
                         ))
 
                         if isinstance(result, types.upload.File):
-                            # Fast pointer array slice replacement (Zero Disk Overhead)
                             async with lock:
                                 file_buffer[offset:offset+len(result.bytes)] = result.bytes
                                 downloaded += len(result.bytes)
                             
-                                # Exact requested layout format: progress percent, current/total, and @ speed
                                 current_mb = downloaded / (1024 * 1024)
                                 elapsed = time.time() - start_time
                                 speed_mbps = current_mb / elapsed if elapsed > 0 else 0
                                 percent = (downloaded / file_size) * 100
-                                print(f'\r⚡ Colab Speed: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
+                                # Trailing spaces handle cursor trailing strings
+                                print(f'\r⚡ Colab Speed: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s          ', end='', flush=True)
                             
                             success = True
                             break
                     except Exception:
-                        await asyncio.sleep(0.3)  # Short sleep before retry
+                        await asyncio.sleep(0.5)  
                 
                 queue.task_done()
                 if not success:
                     await queue.put((offset, limit))
 
         try:
-            # 8 Multi-sockets firing in parallel
             worker_tasks = [asyncio.create_task(worker()) for _ in range(MAX_PARALLEL_CHUNKS)]
             await asyncio.gather(*worker_tasks)
 
@@ -133,7 +128,7 @@ class TelegramDownloader:
             with open(download_path, 'wb') as f:
                 f.write(file_buffer)
                 
-            del file_buffer  # Instant RAM Cleanup
+            del file_buffer  # Clear RAM instantly
 
             elapsed = time.time() - start_time
             avg_speed = total_mb / elapsed if elapsed > 0 else 0
