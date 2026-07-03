@@ -3,6 +3,7 @@ import time
 import asyncio
 import aiofiles
 from telethon import TelegramClient, functions, types
+from telethon.errors import FileMigrateError
 from config import settings
 
 class TelegramDownloader:
@@ -36,30 +37,30 @@ class TelegramDownloader:
 
             download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
 
+            # Progress Bar Function
+            def get_progress_bar(percentage, bar_length=20):
+                filled_length = int(round(bar_length * percentage / 100))
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                return f"[{bar}] {percentage:.1f}%"
+
             try:
-                # File ko correct size par truncate karke khali file create karna
+                # Setup Empty File
                 with open(download_path, 'wb') as f:
                     f.truncate(file_size)
 
-                # Telegram API limits ke mutabik 512KB chunks sabse stable hain
-                # Yeh 4KB aur 1MB dono rules ko strictly follow karta hai
+                # 512KB perfect chunk alignment
                 chunk_size = 512 * 1024  
-                
                 parts = []
                 current_offset = 0
                 while current_offset < file_size:
                     current_limit = min(chunk_size, file_size - current_offset)
-                    # Last chunk ko chhodkar baki sabhi 4KB boundary se align hone chahiye
                     if current_limit % 4096 != 0 and current_offset + current_limit < file_size:
                         current_limit = (current_limit // 4096) * 4096
-
                     parts.append((current_offset, current_limit))
                     current_offset += current_limit
 
                 downloaded = 0
                 start_time = time.time()
-                
-                # Ek baar mein sirf 8 requests parallel bhejne ke liye Semaphore
                 semaphore = asyncio.Semaphore(8)
 
                 file_location = types.InputDocumentFileLocation(
@@ -69,22 +70,34 @@ class TelegramDownloader:
                     thumb_size=''
                 )
 
-                def get_progress_bar(percentage, bar_length=20):
-                    """Custom loading percentage bar generator"""
-                    filled_length = int(round(bar_length * percentage / 100))
-                    bar = '█' * filled_length + '░' * (bar_length - filled_length)
-                    return f"[{bar}] {percentage:.1f}%"
+                # --- CRITICAL DC MIGRATION FIX ---
+                # Default client pool use karenge pehle
+                export_client = self.client
 
                 async def download_chunk(offset, limit):
                     nonlocal downloaded
                     async with semaphore:
-                        # Low-level exact chunk fetch request
-                        result = await self.client(functions.upload.GetFileRequest(
-                            location=file_location,
-                            offset=offset,
-                            limit=limit
-                        ))
-                        
+                        try:
+                            # Correct DC client pool se request bhejenge
+                            result = await export_client(functions.upload.GetFileRequest(
+                                location=file_location,
+                                offset=offset,
+                                limit=limit
+                            ))
+                        except FileMigrateError as e:
+                            # Agar DC change ka error aaya (jaise DC 4), toh yeh part handle karega
+                            nonlocal export_client
+                            print(f"\n🔄 File is on DC {e.dc}. Creating parallel connection pool for DC {e.dc}...")
+                            # Us specific DC ke liye background client connection open karna
+                            export_client = await self.client.get_input_client(e.dc)
+                            
+                            # Sahi client milne ke baad chunk firse request karna
+                            result = await export_client(functions.upload.GetFileRequest(
+                                location=file_location,
+                                offset=offset,
+                                limit=limit
+                            ))
+
                         if isinstance(result, types.upload.File):
                             chunk_data = result.bytes
                             async with aiofiles.open(download_path, 'r+b') as f:
@@ -93,7 +106,7 @@ class TelegramDownloader:
                             
                             downloaded += len(chunk_data)
                             
-                            # Percentage aur live download speed calculation
+                            # Live UI updates
                             current_mb = downloaded / (1024 * 1024)
                             percentage = (downloaded / file_size) * 100
                             elapsed = time.time() - start_time
@@ -102,7 +115,16 @@ class TelegramDownloader:
                             bar_str = get_progress_bar(percentage)
                             print(f'\r⏳ Parallel Download: {bar_str} | {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
 
-                # Saare chunks ko asynchronously parallel queue mein execute karna
+                # Pehle check karne ke liye ek chhota sa 4KB test request bhejenge taaki DC error catch ho sake
+                try:
+                    await self.client(functions.upload.GetFileRequest(location=file_location, offset=0, limit=4096))
+                except FileMigrateError as e:
+                    print(f"🎯 Auto-detected correct file server: DC {e.dc}. Migrating parallel workers...")
+                    export_client = await self.client.get_input_client(e.dc)
+                except Exception:
+                    pass  # Baki normal error test loop handle kar lega
+
+                # Run parallel download tasks
                 tasks = [download_chunk(offset, limit) for offset, limit in parts]
                 await asyncio.gather(*tasks)
 
@@ -126,10 +148,8 @@ class TelegramDownloader:
                     elapsed = time.time() - start_time
                     speed_mbps = current_mb / elapsed if elapsed > 0 else 0
                     
-                    filled_length = int(round(20 * percentage / 100))
-                    bar = '█' * filled_length + '░' * (20 - filled_length)
-                    
-                    print(f'\r⏳ Single Download: [{bar}] {percentage:.1f}% | {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
+                    bar_str = get_progress_bar(percentage)
+                    print(f'\r⏳ Single Download: {bar_str} | {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
 
                 await self.client.download_media(
                     async_msg,
