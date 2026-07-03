@@ -32,30 +32,26 @@ class TelegramDownloader:
                 download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
 
                 try:
-                    # Create empty file with the correct size
+                    # 1. Khali file create karein sahi size ki
                     with open(download_path, 'wb') as f:
                         f.truncate(file_size)
 
-                    # Chunk configuration alignment (must be multiple of 4KB for telegram)
-                    num_chunks = 8
-                    chunk_size = (file_size // num_chunks)
-                    # Align chunk size to 4KB boundary
-                    chunk_size = (chunk_size // 4096) * 4096 
-                    if chunk_size == 0:
-                        chunk_size = 4096
-
-                    # Total parts configuration
-                    parts = []
+                    # 2. Telegram API ke mutabik strictly max 512KB (524288 bytes) ka chunk size
+                    CHUNK_LIMIT = 512 * 1024  
+                    
+                    # 3. Saare chunks (parts) ki list taiyar karein
+                    queue = asyncio.Queue()
                     current_offset = 0
                     while current_offset < file_size:
-                        current_limit = min(chunk_size, file_size - current_offset)
-                        parts.append((current_offset, current_limit))
-                        current_offset += chunk_size
+                        current_limit = min(CHUNK_LIMIT, file_size - current_offset)
+                        # Telegram ko offset hamesha 1024 se divide hone waala chahiye (jo 512KB hamesha hota hai)
+                        await queue.put((current_offset, current_limit))
+                        current_offset += CHUNK_LIMIT
 
                     downloaded = 0
                     start_time = time.time()
                     
-                    # Create InputDocumentFileLocation
+                    # File ki exact location taiyar karein low-level API ke liye
                     file_location = types.InputDocumentFileLocation(
                         id=msg.document.id,
                         access_hash=msg.document.access_hash,
@@ -63,35 +59,51 @@ class TelegramDownloader:
                         thumb_size=''
                     )
 
-                    async def download_chunk(offset, limit):
+                    # 4. Worker function jo parallel mein chunks download karega
+                    async def worker():
                         nonlocal downloaded
-                        
-                        # Low level API request for chunks download
-                        result = await self.client(functions.upload.GetFileRequest(
-                            location=file_location,
-                            offset=offset,
-                            limit=limit
-                        ))
-                        
-                        if isinstance(result, types.upload.File):
-                            chunk_data = result.bytes
-                            async with aiofiles.open(download_path, 'r+b') as f:
-                                await f.seek(offset)
-                                await f.write(chunk_data)
+                        while not queue.empty():
+                            try:
+                                offset, limit = await queue.get()
+                            except asyncio.QueueEmpty:
+                                break
                             
-                            downloaded += len(chunk_data)
-                            
-                            # Real-time progress update
-                            current_mb = downloaded / (1024 * 1024)
-                            elapsed = time.time() - start_time
-                            speed_mbps = current_mb / elapsed if elapsed > 0 else 0
-                            print(f'\r⏳ Parallel Download: {current_mb:.1f}MB / {total_mb:.1f}MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
+                            # Low-level Telegram API call bina kisi limit error ke
+                            try:
+                                result = await self.client(functions.upload.GetFileRequest(
+                                    location=file_location,
+                                    offset=offset,
+                                    limit=limit
+                                ))
+                                
+                                if isinstance(result, types.upload.File):
+                                    chunk_data = result.bytes
+                                    async with aiofiles.open(download_path, 'r+b') as f:
+                                        await f.seek(offset)
+                                        await f.write(chunk_data)
+                                    
+                                    downloaded += len(chunk_data)
+                                    
+                                    # Progress aur speed show karne ke liye
+                                    current_mb = downloaded / (1024 * 1024)
+                                    elapsed = time.time() - start_time
+                                    speed_mbps = current_mb / elapsed if elapsed > 0 else 0
+                                    print(f'\r⏳ Parallel Download: {current_mb:.1f}MB / {total_mb:.1f}MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
+                            except Exception as chunk_err:
+                                # Agar koi chunk fail ho toh use wapas queue mein daal dein retry ke liye
+                                await queue.put((offset, limit))
+                                await asyncio.sleep(1)
+                            finally:
+                                queue.task_done()
 
-                    # Run all chunks concurrently 
-                    tasks = [download_chunk(offset, limit) for offset, limit in parts]
+                    # 5. Exactly 8 parallel workers chalaein
+                    num_workers = 8
+                    tasks = [asyncio.create_task(worker()) for _ in range(num_workers)]
+                    
+                    # Sabhi workers ke khatam hone ka wait karein
                     await asyncio.gather(*tasks)
 
-                    print() # Line break after loop completes
+                    print() # Loop ke baad nayi line ke liye
                     elapsed = time.time() - start_time
                     avg_speed = total_mb / elapsed if elapsed > 0 else 0
                     print(f"✅ Downloaded (Parallel): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
@@ -101,7 +113,7 @@ class TelegramDownloader:
                     print(f"\n⚠️ Parallel download failed: {e}")
                     print("⏳ Falling back to single-threaded download...")
 
-                    # Fallback implementation
+                    # Fallback System (Agar parallel bilkul hi fail ho jaye)
                     downloaded = 0
                     start_time = time.time()
 
