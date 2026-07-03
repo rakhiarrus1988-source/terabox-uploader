@@ -5,3 +5,4 @@ aiofiles==23.2.1
 requests==2.31.0
 selenium==4.15.0
 undetected-chromedriver==3.5.4
+aiohttp==3.9.0
