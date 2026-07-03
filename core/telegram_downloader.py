@@ -1,8 +1,7 @@
 import os
 import time
 import asyncio
-import aiofiles
-from telethon import TelegramClient, functions, types
+from telethon import TelegramClient
 from config import settings
 
 class TelegramDownloader:
@@ -27,100 +26,38 @@ class TelegramDownloader:
                 file_size = msg.file.size
                 total_mb = file_size / (1024 * 1024)
                 print(f"✅ Found! Size: {total_mb:.2f} MB")
-                print("⚡ Trying parallel download (8 chunks)...")
+                print("⚡ Starting high-speed parallel download (8 workers)...")
 
                 download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
+                start_time = time.time()
 
-                # --- PARALLEL DOWNLOAD BLOCK ---
-                try:
-                    # File ka placeholder create karna
-                    with open(download_path, 'wb') as f:
-                        f.truncate(file_size)
-
-                    # Telegram low-level API max limit 512KB hoti hai per request
-                    # Aur yeh 4KB (4096 bytes) se divisible hona compulsory hai
-                    CHUNK_SIZE = 512 * 1024  
-                    
-                    # Ek sath maximum 8 chunks parallel download honge
-                    MAX_PARALLEL_CHUNKS = 8 
-                    semaphore = asyncio.Semaphore(MAX_PARALLEL_CHUNKS)
-
-                    # Saare chunks ki range taiyar karna
-                    parts = []
-                    offset = 0
-                    while offset < file_size:
-                        limit = min(CHUNK_SIZE, file_size - offset)
-                        parts.append((offset, limit))
-                        offset += CHUNK_SIZE
-
-                    downloaded = 0
-                    start_time = time.time()
-
-                    # Telegram document ki location identify karna
-                    file_location = types.InputDocumentFileLocation(
-                        id=msg.document.id,
-                        access_hash=msg.document.access_hash,
-                        file_reference=msg.document.file_reference,
-                        thumb_size=''
-                    )
-
-                    async def download_chunk(offset, limit):
-                        nonlocal downloaded
-                        async with semaphore:
-                            # Direct MTProto API request chunk ke liye
-                            result = await self.client(functions.upload.GetFileRequest(
-                                location=file_location,
-                                offset=offset,
-                                limit=limit
-                            ))
-                            
-                            if isinstance(result, types.upload.File):
-                                chunk_data = result.bytes
-                                async with aiofiles.open(download_path, 'r+b') as f:
-                                    await f.seek(offset)
-                                    await f.write(chunk_data)
-                                
-                                downloaded += len(chunk_data)
-                                
-                                # Progress bar output screen par flush karna
-                                current_mb = downloaded / (1024 * 1024)
-                                elapsed = time.time() - start_time
-                                speed_mbps = current_mb / elapsed if elapsed > 0 else 0
-                                percent = (downloaded / file_size) * 100
-                                print(f'\r⏳ Parallel Download: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
-
-                    # Saari chunks ki task list banakar gather karna
-                    tasks = [download_chunk(offset, limit) for offset, limit in parts]
-                    await asyncio.gather(*tasks)
-
-                    print()  # Line break download khatam hone par
+                # Progress tracker function
+                def progress_callback(current, total):
+                    current_mb = current / (1024 * 1024)
                     elapsed = time.time() - start_time
-                    avg_speed = total_mb / elapsed if elapsed > 0 else 0
-                    print(f"✅ Downloaded (Parallel): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
-                    return download_path
+                    speed_mbps = current_mb / elapsed if elapsed > 0 else 0
+                    percent = (current / total) * 100
+                    print(f'\r⏳ Downloading: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
 
-                except Exception as e:
-                    print(f"\n⚠️ Parallel download failed: {e}")
-                    print("⏳ Falling back to single-threaded download...")
-
-                    # --- FALLBACK SINGLE THREAD BLOCK ---
-                    downloaded = 0
-                    start_time = time.time()
-
-                    def progress_callback(current, total):
-                        current_mb = current / (1024 * 1024)
-                        total_mb = total / (1024 * 1024)
-                        elapsed = time.time() - start_time
-                        speed_mbps = current_mb / elapsed if elapsed > 0 else 0
-                        print(f'\r⏳ Single Download: {current_mb:.1f}MB / {total_mb:.1f}MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
-
+                try:
+                    # 'workers=8' automatic parallel downloading active karega
+                    # Telethon internally file DC 4 par hone par connection switch kar lega
                     await self.client.download_media(
                         msg,
                         file=download_path,
-                        progress_callback=progress_callback
+                        progress_callback=progress_callback,
+                        workers=8
                     )
-                    print()
+                    
+                    print()  # Line break download complete hone par
+                    elapsed = time.time() - start_time
+                    avg_speed = total_mb / elapsed if elapsed > 0 else 0
+                    print(f"✅ Downloaded successfully: {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
                     return download_path
+
+                except Exception as e:
+                    print(f"\n❌ Download failed: {e}")
+                    return None
 
         print(f"❌ '{filename}' not found in Saved Messages!")
         return None
@@ -128,3 +65,4 @@ class TelegramDownloader:
     async def disconnect(self):
         if self.client:
             await self.client.disconnect()
+            print("🔌 Disconnected from Telegram!")
