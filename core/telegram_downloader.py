@@ -70,12 +70,11 @@ class TelegramDownloader:
                     thumb_size=''
                 )
 
-                # --- CRITICAL DC MIGRATION FIX ---
-                # Default client pool use karenge pehle
+                # --- CRITICAL DC MIGRATION FIX WITH CORRECT SCOPE ---
                 export_client = self.client
 
                 async def download_chunk(offset, limit):
-                    nonlocal downloaded
+                    nonlocal downloaded, export_client  # Fixed: Nonlocal declaration placed at the absolute top of the scope
                     async with semaphore:
                         try:
                             # Correct DC client pool se request bhejenge
@@ -85,8 +84,6 @@ class TelegramDownloader:
                                 limit=limit
                             ))
                         except FileMigrateError as e:
-                            # Agar DC change ka error aaya (jaise DC 4), toh yeh part handle karega
-                            nonlocal export_client
                             print(f"\n🔄 File is on DC {e.dc}. Creating parallel connection pool for DC {e.dc}...")
                             # Us specific DC ke liye background client connection open karna
                             export_client = await self.client.get_input_client(e.dc)
