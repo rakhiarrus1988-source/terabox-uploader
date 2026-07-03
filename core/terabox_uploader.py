@@ -1,106 +1,162 @@
 import os
-import json
-import requests
+import time
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import undetected_chromedriver as uc
-from config import settings
-from core.credentials_manager import CredentialsManager
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 
 class TeraboxUploader:
-    def __init__(self):
-        self.cookies = CredentialsManager.load_terabox_cookies()
+    def __init__(self, email, password):
+        self.email = email
+        self.password = password
         self.driver = None
     
-    def login_with_cookies(self):
-        """Login to Terabox using saved cookies"""
-        if not self.cookies:
-            print("⚠️ No saved cookies found. Manual login required.")
-            return self.manual_login()
+    def login(self):
+        """Login to Terabox using email/password"""
+        print("🔐 Logging into Terabox...")
         
-        self.driver = uc.Chrome()
-        self.driver.get("https://www.terabox.com/")
+        # Chrome options for Colab
+        options = Options()
+        options.add_argument('--headless=new')  # Headless mode
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
         
-        for cookie in self.cookies:
-            self.driver.add_cookie(cookie)
-        
-        self.driver.refresh()
-        print("✅ Logged in using saved cookies!")
-        return True
-    
-    def manual_login(self):
-        """Manual login to Terabox (opens browser)"""
-        print("🌐 Opening browser for Terabox login...")
-        self.driver = uc.Chrome()
-        self.driver.get("https://www.terabox.com/login")
-        
-        input("⌨️ Please login manually in the browser, then press Enter here...")
-        
-        cookies = self.driver.get_cookies()
-        CredentialsManager.save_terabox_cookies(cookies)
-        print("✅ Cookies saved for future use!")
-        return True
+        try:
+            # Colab mein ChromeDriver ka path
+            chrome_paths = [
+                '/usr/lib/chromium-browser/chromedriver',
+                '/usr/bin/chromedriver',
+                '/usr/lib/chromium/chromedriver'
+            ]
+            
+            driver_path = None
+            for path in chrome_paths:
+                if os.path.exists(path):
+                    driver_path = path
+                    break
+            
+            if driver_path:
+                service = Service(driver_path)
+                self.driver = webdriver.Chrome(service=service, options=options)
+            else:
+                # Auto-detect
+                self.driver = webdriver.Chrome(options=options)
+            
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
+            print("🌐 Opening Terabox login page...")
+            self.driver.get("https://www.terabox.com/")
+            time.sleep(3)
+            
+            # Click login button first (if visible)
+            try:
+                login_btn = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Login')]"))
+                )
+                login_btn.click()
+                time.sleep(2)
+            except:
+                pass
+            
+            # Find email/username field
+            email_input = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//input[@type='email' or @name='email' or contains(@placeholder, 'email') or contains(@placeholder, 'Email')]"))
+            )
+            email_input.clear()
+            email_input.send_keys(self.email)
+            
+            # Find password field
+            pass_input = self.driver.find_element(By.XPATH, "//input[@type='password']")
+            pass_input.clear()
+            pass_input.send_keys(self.password)
+            
+            # Click login/submit button
+            submit_btn = self.driver.find_element(By.XPATH, "//button[@type='submit' or contains(text(), 'Login') or contains(text(), 'Sign in')]")
+            submit_btn.click()
+            
+            time.sleep(5)
+            
+            # Check if login successful
+            if "login" not in self.driver.current_url.lower():
+                print("✅ Logged in to Terabox successfully!")
+                return True
+            else:
+                print("❌ Login failed - Still on login page")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Login error: {e}")
+            return False
     
     def upload_file(self, file_path):
         """Upload file to Terabox"""
         if not os.path.exists(file_path):
             print(f"❌ File not found: {file_path}")
-            return None
+            return False
         
-        print(f"📤 Uploading to Terabox: {os.path.basename(file_path)}")
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path) / (1024 * 1024)
+        print(f"📤 Uploading to Terabox: {filename} ({file_size:.2f} MB)")
         
-        # Method 1: Try using requests with cookies
         try:
-            upload_url = "https://www.terabox.com/api/v1/upload"
-            files = {'file': open(file_path, 'rb')}
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            response = requests.post(upload_url, files=files, cookies=self.cookies, headers=headers)
-            
-            if response.status_code == 200:
-                print("✅ Upload successful!")
-                return response.json()
-            else:
-                print(f"⚠️ Upload failed: {response.status_code}")
-        except Exception as e:
-            print(f"⚠️ Upload error: {e}")
-        
-        # Method 2: Fallback to browser automation
-        print("🔄 Trying browser automation...")
-        return self.upload_with_browser(file_path)
-    
-    def upload_with_browser(self, file_path):
-        """Upload using browser automation"""
-        try:
-            if not self.driver:
-                self.login_with_cookies()
-            
+            # Go to homepage
             self.driver.get("https://www.terabox.com/")
+            time.sleep(3)
             
+            # Find and click upload button
             upload_btn = WebDriverWait(self.driver, 10).until(
                 EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Upload')]"))
             )
             upload_btn.click()
+            time.sleep(2)
             
-            file_input = self.driver.find_element(By.XPATH, "//input[@type='file']")
-            file_input.send_keys(os.path.abspath(file_path))
-            
-            print("⏳ Upload in progress...")
-            WebDriverWait(self.driver, 300).until(
-                EC.presence_of_element_located((By.XPATH, "//div[contains(text(), 'Complete')]"))
+            # Find file input element
+            file_input = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
             )
             
-            print("✅ Upload complete!")
+            # Send file path
+            file_input.send_keys(os.path.abspath(file_path))
+            
+            print("⏳ Upload in progress... This may take a while.")
+            
+            # Wait for upload to complete (max 10 minutes)
+            max_wait = 600
+            wait_interval = 10
+            elapsed = 0
+            
+            while elapsed < max_wait:
+                try:
+                    page_source = self.driver.page_source.lower()
+                    if "complete" in page_source or "success" in page_source or "done" in page_source:
+                        print("✅ Upload complete!")
+                        return True
+                except:
+                    pass
+                
+                time.sleep(wait_interval)
+                elapsed += wait_interval
+                print(f"⏳ Still uploading... {elapsed}s elapsed")
+            
+            print("⚠️ Upload timeout - Check Terabox manually")
             return True
+            
         except Exception as e:
-            print(f"❌ Browser upload failed: {e}")
+            print(f"❌ Upload error: {e}")
             return False
     
     def close(self):
         """Close browser"""
         if self.driver:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+                print("✅ Browser closed")
+            except:
+                pass
