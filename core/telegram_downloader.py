@@ -2,7 +2,7 @@ import os
 import time
 import asyncio
 import aiofiles
-from telethon import TelegramClient
+from telethon import TelegramClient, functions, types
 from config import settings
 
 class TelegramDownloader:
@@ -11,122 +11,118 @@ class TelegramDownloader:
         self.api_hash = api_hash
         self.session_file = session_file
         self.client = None
-    
+
     async def connect(self):
         self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
         await self.client.start()
         print("✅ Connected to Telegram!")
         return self.client
-    
+
     async def download_file(self, filename):
         saved_messages = 'me'
         print(f"🔍 Searching for '{filename}' in Saved Messages...")
-        
+
         async for msg in self.client.iter_messages(saved_messages, search=filename):
             if msg.media and hasattr(msg, 'document') and msg.document:
                 file_size = msg.file.size
                 total_mb = file_size / (1024 * 1024)
                 print(f"✅ Found! Size: {total_mb:.2f} MB")
                 print("⚡ Trying parallel download (8 chunks)...")
-                
+
                 download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
-                
-                # Try parallel first
+
                 try:
-                    # Create empty file
+                    # Create empty file with the correct size
                     with open(download_path, 'wb') as f:
                         f.truncate(file_size)
-                    
+
+                    # Chunk configuration alignment (must be multiple of 4KB for telegram)
                     num_chunks = 8
-                    chunk_size = file_size // num_chunks
-                    
+                    chunk_size = (file_size // num_chunks)
+                    # Align chunk size to 4KB boundary
+                    chunk_size = (chunk_size // 4096) * 4096 
+                    if chunk_size == 0:
+                        chunk_size = 4096
+
+                    # Total parts configuration
+                    parts = []
+                    current_offset = 0
+                    while current_offset < file_size:
+                        current_limit = min(chunk_size, file_size - current_offset)
+                        parts.append((current_offset, current_limit))
+                        current_offset += chunk_size
+
                     downloaded = 0
-                    last_update = 0
                     start_time = time.time()
                     
-                    async def download_chunk(chunk_num):
+                    # Create InputDocumentFileLocation
+                    file_location = types.InputDocumentFileLocation(
+                        id=msg.document.id,
+                        access_hash=msg.document.access_hash,
+                        file_reference=msg.document.file_reference,
+                        thumb_size=''
+                    )
+
+                    async def download_chunk(offset, limit):
                         nonlocal downloaded
-                        start = chunk_num * chunk_size
-                        end = start + chunk_size if chunk_num < num_chunks - 1 else file_size
                         
-                        # Download chunk using msg.document directly
-                        chunk_data = await self.client.download_file(
-                            msg.document,
-                            offset=start,
-                            limit=end - start,
-                            request_size=2 * 1024 * 1024
-                        )
+                        # Low level API request for chunks download
+                        result = await self.client(functions.upload.GetFileRequest(
+                            location=file_location,
+                            offset=offset,
+                            limit=limit
+                        ))
                         
-                        async with aiofiles.open(download_path, 'r+b') as f:
-                            await f.seek(start)
-                            await f.write(chunk_data)
-                        
-                        downloaded += (end - start)
-                        return True
-                    
-                    tasks = [download_chunk(i) for i in range(num_chunks)]
-                    for task in asyncio.as_completed(tasks):
-                        await task
-                        
-                        if time.time() - last_update > 0.5 or downloaded >= file_size:
-                            last_update = time.time()
+                        if isinstance(result, types.upload.File):
+                            chunk_data = result.bytes
+                            async with aiofiles.open(download_path, 'r+b') as f:
+                                await f.seek(offset)
+                                await f.write(chunk_data)
+                            
+                            downloaded += len(chunk_data)
+                            
+                            # Real-time progress update
                             current_mb = downloaded / (1024 * 1024)
                             elapsed = time.time() - start_time
-                            if elapsed > 0:
-                                speed_mbps = (downloaded / (1024 * 1024)) / elapsed
-                                print(f'\r⏳ Parallel Download: {current_mb:.1f}MB / {total_mb:.1f}MB @ {speed_mbps:.1f} MB/s', end='')
-                            else:
-                                print(f'\r⏳ Parallel Download: {current_mb:.1f}MB / {total_mb:.1f}MB', end='')
-                            
-                            if downloaded >= file_size:
-                                print()
-                                elapsed = time.time() - start_time
-                                avg_speed = (file_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                                print(f"✅ Downloaded (Parallel): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
-                                return download_path
-                    
-                    # If we reach here, parallel succeeded
+                            speed_mbps = current_mb / elapsed if elapsed > 0 else 0
+                            print(f'\r⏳ Parallel Download: {current_mb:.1f}MB / {total_mb:.1f}MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
+
+                    # Run all chunks concurrently 
+                    tasks = [download_chunk(offset, limit) for offset, limit in parts]
+                    await asyncio.gather(*tasks)
+
+                    print() # Line break after loop completes
+                    elapsed = time.time() - start_time
+                    avg_speed = total_mb / elapsed if elapsed > 0 else 0
+                    print(f"✅ Downloaded (Parallel): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
                     return download_path
-                    
+
                 except Exception as e:
                     print(f"\n⚠️ Parallel download failed: {e}")
                     print("⏳ Falling back to single-threaded download...")
-                    
-                    # Fallback: single-threaded download with progress
+
+                    # Fallback implementation
                     downloaded = 0
-                    last_update = 0
                     start_time = time.time()
-                    
+
                     def progress_callback(current, total):
-                        nonlocal downloaded, last_update
-                        downloaded = current
-                        if time.time() - last_update > 0.5 or current == total:
-                            last_update = time.time()
-                            current_mb = current / (1024 * 1024)
-                            total_mb = total / (1024 * 1024)
-                            elapsed = time.time() - start_time
-                            if elapsed > 0:
-                                speed_mbps = (current / (1024 * 1024)) / elapsed
-                                print(f'\r⏳ Single Download: {current_mb:.1f}MB / {total_mb:.1f}MB @ {speed_mbps:.1f} MB/s', end='')
-                            else:
-                                print(f'\r⏳ Single Download: {current_mb:.1f}MB / {total_mb:.1f}MB', end='')
-                            if current == total:
-                                print()
-                    
+                        current_mb = current / (1024 * 1024)
+                        total_mb = total / (1024 * 1024)
+                        elapsed = time.time() - start_time
+                        speed_mbps = current_mb / elapsed if elapsed > 0 else 0
+                        print(f'\r⏳ Single Download: {current_mb:.1f}MB / {total_mb:.1f}MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
+
                     await self.client.download_media(
                         msg,
                         file=download_path,
                         progress_callback=progress_callback
                     )
-                    
-                    elapsed = time.time() - start_time
-                    avg_speed = (file_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                    print(f"✅ Downloaded (Single): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
+                    print()
                     return download_path
-        
+
         print(f"❌ '{filename}' not found in Saved Messages!")
         return None
-    
+
     async def disconnect(self):
         if self.client:
             await self.client.disconnect()
