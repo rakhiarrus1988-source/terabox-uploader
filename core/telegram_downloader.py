@@ -14,24 +14,21 @@ class TelegramDownloader:
         self.client = None
     
     async def connect(self):
-        """Connect to Telegram"""
         self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
         await self.client.start()
         print("✅ Connected to Telegram!")
         return self.client
     
     async def download_file(self, filename):
-        """Search and download file from Saved Messages - PARALLEL"""
         saved_messages = 'me'
-        
         print(f"🔍 Searching for '{filename}' in Saved Messages...")
         
         async for msg in self.client.iter_messages(saved_messages, search=filename):
-            if msg.media:
+            if msg.media and hasattr(msg, 'document') and msg.document:
                 file_size = msg.file.size
                 total_mb = file_size / (1024 * 1024)
                 print(f"✅ Found! Size: {total_mb:.2f} MB")
-                print("⚡ Parallel download starting (8 chunks)...")
+                print("⚡ Parallel download with 8 chunks...")
                 
                 download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
                 
@@ -39,8 +36,16 @@ class TelegramDownloader:
                 with open(download_path, 'wb') as f:
                     f.truncate(file_size)
                 
+                # Prepare file location
+                location = InputDocumentFileLocation(
+                    id=msg.document.id,
+                    access_hash=msg.document.access_hash,
+                    file_reference=msg.document.file_reference,
+                    thumb_size=''
+                )
+                
                 # Parallel chunk settings
-                num_chunks = 8  # 8 parallel connections
+                num_chunks = 8
                 chunk_size = file_size // num_chunks
                 
                 downloaded = 0
@@ -53,12 +58,12 @@ class TelegramDownloader:
                     end = start + chunk_size if chunk_num < num_chunks - 1 else file_size
                     
                     try:
-                        # Download chunk using correct method
+                        # Download chunk with offset/limit
                         chunk_data = await self.client.download_file(
-                            msg.document,  # Direct document object
+                            location,
                             offset=start,
                             limit=end - start,
-                            request_size=2 * 1024 * 1024  # 2MB chunks
+                            request_size=2 * 1024 * 1024  # 2MB per request
                         )
                         
                         # Write chunk to file
@@ -74,8 +79,6 @@ class TelegramDownloader:
                 
                 # Create and run tasks
                 tasks = [download_chunk(i) for i in range(num_chunks)]
-                
-                # Process with progress
                 for task in asyncio.as_completed(tasks):
                     await task
                     
@@ -83,7 +86,6 @@ class TelegramDownloader:
                     if time.time() - last_update > 0.5 or downloaded >= file_size:
                         last_update = time.time()
                         current_mb = downloaded / (1024 * 1024)
-                        
                         elapsed = time.time() - start_time
                         if elapsed > 0:
                             speed_mbps = (downloaded / (1024 * 1024)) / elapsed
@@ -102,6 +104,5 @@ class TelegramDownloader:
         return None
     
     async def disconnect(self):
-        """Disconnect from Telegram"""
         if self.client:
             await self.client.disconnect()
