@@ -108,12 +108,12 @@ class TelegramDownloader:
                                 file_buffer[offset:offset+len(result.bytes)] = result.bytes
                                 downloaded += len(result.bytes)
                             
-                            # Speed speedometer calculation
-                            current_mb = downloaded / (1024 * 1024)
-                            elapsed = time.time() - start_time
-                            speed_mbps = current_mb / elapsed if elapsed > 0 else 0
-                            percent = (downloaded / file_size) * 100
-                            print(f'\r⚡ Colab Speed: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
+                                # Exact requested layout format: progress percent, current/total, and @ speed
+                                current_mb = downloaded / (1024 * 1024)
+                                elapsed = time.time() - start_time
+                                speed_mbps = current_mb / elapsed if elapsed > 0 else 0
+                                percent = (downloaded / file_size) * 100
+                                print(f'\r⚡ Colab Speed: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
                             
                             success = True
                             break
