@@ -22,50 +22,63 @@ class TelegramDownloader:
         saved_messages = 'me'
         print(f"🔍 Searching for '{filename}' in Saved Messages...")
 
+        async_msg = None
         async for msg in self.client.iter_messages(saved_messages, search=filename):
             if msg.media and hasattr(msg, 'document') and msg.document:
-                file_size = msg.file.size
-                total_mb = file_size / (1024 * 1024)
-                print(f"✅ Found! Size: {total_mb:.2f} MB")
-                print("⚡ Trying parallel download (8 chunks)...")
+                async_msg = msg
+                break
 
-                download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
+        if async_msg:
+            file_size = async_msg.file.size
+            total_mb = file_size / (1024 * 1024)
+            print(f"✅ Found! Size: {total_mb:.2f} MB")
+            print("⚡ Trying parallel download (8 chunks max concurrency)...")
 
-                # Try parallel first
-                try:
-                    # Create empty file
-                    with open(download_path, 'wb') as f:
-                        f.truncate(file_size)
+            download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
 
-                    # Telegram parallel chunks configuration (must align with 4KB boundaries)
-                    num_chunks = 8
-                    chunk_size = (file_size // num_chunks)
-                    chunk_size = (chunk_size // 4096) * 4096 
-                    if chunk_size == 0:
-                        chunk_size = 4096
+            try:
+                # File ko correct size par truncate karke khali file create karna
+                with open(download_path, 'wb') as f:
+                    f.truncate(file_size)
 
-                    parts = []
-                    current_offset = 0
-                    while current_offset < file_size:
-                        current_limit = min(chunk_size, file_size - current_offset)
-                        parts.append((current_offset, current_limit))
-                        current_offset += chunk_size
+                # Telegram API limits ke mutabik 512KB chunks sabse stable hain
+                # Yeh 4KB aur 1MB dono rules ko strictly follow karta hai
+                chunk_size = 512 * 1024  
+                
+                parts = []
+                current_offset = 0
+                while current_offset < file_size:
+                    current_limit = min(chunk_size, file_size - current_offset)
+                    # Last chunk ko chhodkar baki sabhi 4KB boundary se align hone chahiye
+                    if current_limit % 4096 != 0 and current_offset + current_limit < file_size:
+                        current_limit = (current_limit // 4096) * 4096
 
-                    downloaded = 0
-                    start_time = time.time()
-                    
-                    # Direct file location reference for low-level API chunks
-                    file_location = types.InputDocumentFileLocation(
-                        id=msg.document.id,
-                        access_hash=msg.document.access_hash,
-                        file_reference=msg.document.file_reference,
-                        thumb_size=''
-                    )
+                    parts.append((current_offset, current_limit))
+                    current_offset += current_limit
 
-                    async def download_chunk(offset, limit):
-                        nonlocal downloaded
-                        
-                        # API call to download specific byte range offset without errors
+                downloaded = 0
+                start_time = time.time()
+                
+                # Ek baar mein sirf 8 requests parallel bhejne ke liye Semaphore
+                semaphore = asyncio.Semaphore(8)
+
+                file_location = types.InputDocumentFileLocation(
+                    id=async_msg.document.id,
+                    access_hash=async_msg.document.access_hash,
+                    file_reference=async_msg.document.file_reference,
+                    thumb_size=''
+                )
+
+                def get_progress_bar(percentage, bar_length=20):
+                    """Custom loading percentage bar generator"""
+                    filled_length = int(round(bar_length * percentage / 100))
+                    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                    return f"[{bar}] {percentage:.1f}%"
+
+                async def download_chunk(offset, limit):
+                    nonlocal downloaded
+                    async with semaphore:
+                        # Low-level exact chunk fetch request
                         result = await self.client(functions.upload.GetFileRequest(
                             location=file_location,
                             offset=offset,
@@ -80,50 +93,51 @@ class TelegramDownloader:
                             
                             downloaded += len(chunk_data)
                             
-                            # Custom minimal progress layout as requested
+                            # Percentage aur live download speed calculation
+                            current_mb = downloaded / (1024 * 1024)
                             percentage = (downloaded / file_size) * 100
                             elapsed = time.time() - start_time
-                            speed_mbps = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                            speed_mbps = current_mb / elapsed if elapsed > 0 else 0
                             
-                            # Standard line-replacement output formatting
-                            print(f'\r⏳ Parallel Download: {percentage:.1f}% Download @ {speed_mbps:.2f} MB/s', end='', flush=True)
+                            bar_str = get_progress_bar(percentage)
+                            print(f'\r⏳ Parallel Download: {bar_str} | {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
 
-                    tasks = [download_chunk(offset, limit) for offset, limit in parts]
-                    await asyncio.gather(*tasks)
+                # Saare chunks ko asynchronously parallel queue mein execute karna
+                tasks = [download_chunk(offset, limit) for offset, limit in parts]
+                await asyncio.gather(*tasks)
 
-                    # Parallel sequence finished successfully
-                    print()
+                print()  # Line break for cleanup
+                elapsed = time.time() - start_time
+                avg_speed = total_mb / elapsed if elapsed > 0 else 0
+                print(f"✅ Downloaded (Parallel): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
+                return download_path
+
+            except Exception as e:
+                print(f"\n⚠️ Parallel download failed: {e}")
+                print("⏳ Falling back to single-threaded download...")
+
+                downloaded = 0
+                start_time = time.time()
+
+                def progress_callback(current, total):
+                    current_mb = current / (1024 * 1024)
+                    total_mb = total / (1024 * 1024)
+                    percentage = (current / total) * 100
                     elapsed = time.time() - start_time
-                    avg_speed = (file_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                    print(f"✅ Downloaded (Parallel): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
-                    return download_path
+                    speed_mbps = current_mb / elapsed if elapsed > 0 else 0
+                    
+                    filled_length = int(round(20 * percentage / 100))
+                    bar = '█' * filled_length + '░' * (20 - filled_length)
+                    
+                    print(f'\r⏳ Single Download: [{bar}] {percentage:.1f}% | {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
 
-                except Exception as e:
-                    print(f"\n⚠️ Parallel download failed: {e}")
-                    print("⏳ Falling back to single-threaded download...")
-
-                    # Fallback: single-threaded download with progress
-                    downloaded = 0
-                    start_time = time.time()
-
-                    def progress_callback(current, total):
-                        current_mb = current / (1024 * 1024)
-                        total_mb = total / (1024 * 1024)
-                        elapsed = time.time() - start_time
-                        speed_mbps = current_mb / elapsed if elapsed > 0 else 0
-                        print(f'\r⏳ Single Download: {current_mb:.1f}MB / {total_mb:.1f}MB @ {speed_mbps:.1f} MB/s', end='', flush=True)
-
-                    await self.client.download_media(
-                        msg,
-                        file=download_path,
-                        progress_callback=progress_callback
-                    )
-                    print()
-
-                    elapsed = time.time() - start_time
-                    avg_speed = (file_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                    print(f"✅ Downloaded (Single): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
-                    return download_path
+                await self.client.download_media(
+                    async_msg,
+                    file=download_path,
+                    progress_callback=progress_callback
+                )
+                print()
+                return download_path
 
         print(f"❌ '{filename}' not found in Saved Messages!")
         return None
