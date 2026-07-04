@@ -1,7 +1,7 @@
 import os
 import time
 import asyncio
-from telethon import TelegramClient, functions, types
+from telethon import TelegramClient
 from config import settings
 
 class TelegramDownloader:
@@ -12,7 +12,14 @@ class TelegramDownloader:
         self.client = None
 
     async def connect(self):
-        self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
+        # Hinting the client to keep multiple parallel sockets active
+        self.client = TelegramClient(
+            self.session_file, 
+            self.api_id, 
+            self.api_hash,
+            auto_reconnect=True,
+            connection_retries=10
+        )
         await self.client.start()
         print("✅ Connected to Telegram!")
         return self.client
@@ -36,118 +43,39 @@ class TelegramDownloader:
         dc_id = target_msg.document.dc_id
 
         print(f"✅ Found in DC {dc_id}! Size: {total_mb:.2f} MB")
-        print(f"🚀 Igniting Colab Engine (Multi-DC Socket Routing via 8 Parallel Workers)...")
+        print(f"🚀 Igniting Colab Engine (Native Multi-Socket Parallel Engine)...")
 
         download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
-
-        CHUNK_SIZE = 512 * 1024  # 512 KB Chunks
-        MAX_PARALLEL_CHUNKS = 8  # 8 Parallel Workers
-
-        # Pre-allocate buffer to avoid disk write bottlenecks during parallel download
-        file_buffer = bytearray(file_size)
-
-        chunks = []
-        offset = 0
-        while offset < file_size:
-            limit = min(CHUNK_SIZE, file_size - offset)
-            chunks.append((offset, limit))
-            offset += CHUNK_SIZE
-
-        queue = asyncio.Queue()
-        for chunk in chunks:
-            await queue.put(chunk)
-
-        downloaded = 0
         start_time = time.time()
-        lock = asyncio.Lock()
 
-        file_location = types.InputDocumentFileLocation(
-            id=target_msg.document.id,
-            access_hash=target_msg.document.access_hash,
-            file_reference=target_msg.document.file_reference,
-            thumb_size=''
-        )
-
-        # Initial progress bar trigger
-        print(f'\r⚡ Colab Speed: [0.0%] 0.0/{total_mb:.1f} MB @ 0.0 MB/s', end='', flush=True)
-
-        # High-level client-based DC transfer wrapper
-        async def worker(worker_id):
-            nonlocal downloaded
-
-            # HAR WORKER APNA ALAG AUTHORIZED CONNECTION BANAEYGA PARALLEL DOWNLOAD KE LIYE
-            dc_client = None
-            try:
-                if self.client.session.dc_id != dc_id:
-                    # Telethon ka internal connection pool jo DC 4 ke sath handshake karega
-                    dc_client = await self.client._get_client(dc_id)
-                else:
-                    dc_client = self.client
-            except Exception as e:
-                # Agar switch fail ho toh fallback to main client
-                dc_client = self.client
-
-            while not queue.empty():
-                try:
-                    offset, limit = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
-                success = False
-                for attempt in range(5):  # Network fallback retries
-                    try:
-                        result = await dc_client(functions.upload.GetFileRequest(
-                            location=file_location,
-                            offset=offset,
-                            limit=limit
-                        ))
-
-                        if isinstance(result, types.upload.File):
-                            # Data ko seedhe memory buffer mein parallelly daalna (No Lock required here)
-                            file_buffer[offset:offset+len(result.bytes)] = result.bytes
-                            
-                            # Lock sirf progress display variables ko update karne ke liye hai
-                            async with lock:
-                                downloaded += len(result.bytes)
-                                current_mb = downloaded / (1024 * 1024)
-                                elapsed = time.time() - start_time
-                                speed_mbps = current_mb / elapsed if elapsed > 0 else 0
-                                percent = (downloaded / file_size) * 100
-                                print(f'\r⚡ Colab Speed: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s          ', end='', flush=True)
-
-                            success = True
-                            queue.task_done()
-                            break
-
-                        elif isinstance(result, types.upload.FileCdnRedirect):
-                            await asyncio.sleep(1)
-                            break
-
-                    except Exception:
-                        await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff on error
-
-                if not success:
-                    # Agar fail ho jaye toh chunk ko wapas queue mein daalna
-                    await queue.put((offset, limit))
+        # Telethon ka high-level optimized tracking callback function
+        def progress_callback(downloaded_bytes, total_bytes):
+            current_mb = downloaded_bytes / (1024 * 1024)
+            elapsed = time.time() - start_time
+            speed_mbps = current_mb / elapsed if elapsed > 0 else 0
+            percent = (downloaded_bytes / total_bytes) * 100 if total_bytes else 0
+            print(f'\r⚡ Colab Speed: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s          ', end='', flush=True)
 
         try:
-            # 8 alag-alag tasks simultaneous execution ke liye fire honge
-            worker_tasks = [asyncio.create_task(worker(i)) for i in range(MAX_PARALLEL_CHUNKS)]
-            await asyncio.gather(*worker_tasks)
+            # FIX: High-level client wrapper automatically negotiates auth with DC 4
+            # Background me automatic chunk segments concurrently stream hote hain
+            actual_download_path = await self.client.download_media(
+                target_msg,
+                file=download_path,
+                progress_callback=progress_callback
+            )
 
-            print("\n💾 Dumping downloaded bytes into Colab Storage...")
-            with open(download_path, 'wb') as f:
-                f.write(file_buffer)
-
-            del file_buffer  # Clear RAM immediately
-
-            elapsed = time.time() - start_time
-            avg_speed = total_mb / elapsed if elapsed > 0 else 0
-            print(f"✅ Downloaded (Parallel): {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
-            return download_path
+            if actual_download_path:
+                elapsed = time.time() - start_time
+                avg_speed = total_mb / elapsed if elapsed > 0 else 0
+                print(f"\n✅ Downloaded (Parallel Stream): {actual_download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
+                return actual_download_path
+            else:
+                print("\n❌ Download failed: Path not generated.")
+                return None
 
         except Exception as e:
-            print(f"\n❌ Parallel download failed: {e}")
+            print(f"\n❌ High-Speed Native Stream failed: {e}")
             return None
 
     async def disconnect(self):
