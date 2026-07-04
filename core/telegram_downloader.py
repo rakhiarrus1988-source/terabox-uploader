@@ -1,7 +1,6 @@
 import os
 import time
 import asyncio
-import aiofiles
 from telethon import TelegramClient, functions, types
 from config import settings
 
@@ -37,15 +36,14 @@ class TelegramDownloader:
         dc_id = target_msg.document.dc_id
         
         print(f"✅ Found in DC {dc_id}! Size: {total_mb:.2f} MB")
-        print("🚀 Igniting Colab Engine (In-Memory Ring Buffering via 8 Workers)...")
-        print("⏳ Establishing connection with Data Center server...", end='', flush=True)
+        print("🚀 Igniting Colab Engine (Multi-DC Socket Routing via 8 Workers)...")
 
         download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
         
-        CHUNK_SIZE = 512 * 1024  # Max allowed MTProto chunk size (512 KB)
-        MAX_PARALLEL_CHUNKS = 8  # Fixed 8 workers
+        CHUNK_SIZE = 512 * 1024  # 512 KB Chunks
+        MAX_PARALLEL_CHUNKS = 8  # 8 Parallel Threads
 
-        # Memory Buffer Allocation to bypass disk write latency during download
+        # Pre-allocate buffer to avoid disk bottlenecks
         file_buffer = bytearray(file_size)
 
         chunks = []
@@ -70,17 +68,21 @@ class TelegramDownloader:
             thumb_size=''
         )
 
-        # Instant progress layout init takki pata chale script download state me aa chuki hai
+        # Initial progress bar trigger
         print(f'\r⚡ Colab Speed: [0.0%] 0.0/{total_mb:.1f} MB @ 0.0 MB/s', end='', flush=True)
 
+        # High-level client-based DC transfer wrapper
         async def worker():
             nonlocal downloaded
+            
+            # Agar main client usi DC par nahi hai jahan file hai, toh export use karenge
+            # Yeh bina freeze hue background mein automatic authorization switch karta hai
             try:
-                # Direct safe multi-DC connection routing
-                if self.client.session.dc_id == dc_id:
-                    dc_client = self.client
+                if self.client.session.dc_id != dc_id:
+                    # Dynamic connection pool for target DC
+                    dc_client = await self.client.create_exported_phone_connection(dc_id)
                 else:
-                    dc_client = await self.client._get_client(dc_id)
+                    dc_client = self.client
             except Exception:
                 dc_client = self.client
 
@@ -91,7 +93,7 @@ class TelegramDownloader:
                     break
 
                 success = False
-                for attempt in range(5):  # Retry mechanics
+                for attempt in range(5):  # Network fallback retries
                     try:
                         result = await dc_client(functions.upload.GetFileRequest(
                             location=file_location,
@@ -108,11 +110,16 @@ class TelegramDownloader:
                                 elapsed = time.time() - start_time
                                 speed_mbps = current_mb / elapsed if elapsed > 0 else 0
                                 percent = (downloaded / file_size) * 100
-                                # Trailing spaces handle cursor trailing strings
                                 print(f'\r⚡ Colab Speed: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s          ', end='', flush=True)
                             
                             success = True
                             break
+                        
+                        elif isinstance(result, types.upload.FileCdnRedirect):
+                            # Handle rare CDN redirections if Telegram pushes it
+                            await asyncio.sleep(1)
+                            break
+                            
                     except Exception:
                         await asyncio.sleep(0.5)  
                 
@@ -121,6 +128,7 @@ class TelegramDownloader:
                     await queue.put((offset, limit))
 
         try:
+            # Spawning 8 non-blocking workers simultaneously
             worker_tasks = [asyncio.create_task(worker()) for _ in range(MAX_PARALLEL_CHUNKS)]
             await asyncio.gather(*worker_tasks)
 
@@ -128,7 +136,7 @@ class TelegramDownloader:
             with open(download_path, 'wb') as f:
                 f.write(file_buffer)
                 
-            del file_buffer  # Clear RAM instantly
+            del file_buffer  # Clear RAM immediately
 
             elapsed = time.time() - start_time
             avg_speed = total_mb / elapsed if elapsed > 0 else 0
