@@ -1,79 +1,87 @@
 import os
 import time
 import asyncio
-from telethon import TelegramClient, errors
+from pyrogram import Client
+from pyrogram.errors import FloodWait
 from config import settings
 
-class TelegramDownloader:
-    def __init__(self, api_id, api_hash, session_file):
+class PyrogramDownloader:
+    def __init__(self, api_id, api_hash, session_name="my_account"):
         self.api_id = api_id
         self.api_hash = api_hash
-        self.session_file = session_file
-        self.client = None
+        self.session_name = session_name
+        self.app = None
 
     async def connect(self):
-        self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
-        await self.client.start()
-        print("✅ Connected to Telegram!")
-        return self.client
+        self.app = Client(
+            self.session_name,
+            api_id=self.api_id,
+            api_hash=self.api_hash
+        )
+        await self.app.start()
+        print("✅ Pyrogram connected!")
+        return self.app
 
-    async def download_file(self, filename):
-        saved_messages = 'me'
+    async def disconnect(self):
+        if self.app:
+            await self.app.stop()
+            print("🔌 Disconnected!")
+
+    async def download_file(self, filename, workers=8):
+        """
+        Search file in Saved Messages and download using multiple workers.
+        workers = number of parallel connections (default 8)
+        """
         print(f"🔍 Searching for '{filename}' in Saved Messages...")
-
-        target_msg = None
-        async for msg in self.client.iter_messages(saved_messages, search=filename):
-            if msg.media and hasattr(msg, 'document') and msg.document:
-                target_msg = msg
+        # Fetch the first matching document
+        message = None
+        async for msg in self.app.get_chat_history("me"):
+            if msg.document and filename.lower() in (msg.document.file_name or "").lower():
+                message = msg
                 break
 
-        if not target_msg:
-            print(f"❌ '{filename}' not found in Saved Messages!")
+        if not message:
+            print(f"❌ '{filename}' not found!")
             return None
 
-        file_size = target_msg.file.size
+        file_size = message.document.file_size
         total_mb = file_size / (1024 * 1024)
-        dc_id = target_msg.document.dc_id
-
-        print(f"✅ Found in DC {dc_id}! Size: {total_mb:.2f} MB")
-        print("🚀 Igniting High-Speed Stream Tunnel...")
+        print(f"✅ Found! Size: {total_mb:.2f} MB")
+        print(f"🚀 Downloading using {workers} parallel workers...")
 
         download_path = os.path.join(settings.DOWNLOAD_DIR, filename)
         start_time = time.time()
 
-        # Custom progress bar with real-time single-thread speed calculation
-        def progress_callback(downloaded_bytes, total_bytes):
-            current_mb = downloaded_bytes / (1024 * 1024)
+        # Progress callback
+        def progress(current, total):
+            current_mb = current / (1024 * 1024)
+            total_mb_progress = total / (1024 * 1024)
             elapsed = time.time() - start_time
-            speed_mbps = current_mb / elapsed if elapsed > 0 else 0
-            percent = (downloaded_bytes / total_bytes) * 100
-            print(f'\r⚡ Colab Speed: [{percent:.1f}%] {current_mb:.1f}/{total_mb:.1f} MB @ {speed_mbps:.1f} MB/s          ', end='', flush=True)
-
-        try:
-            # FIX: Using native high-level stream downloader
-            # It handles internal DC migration, keys handshake, and authorization securely
-            await self.client.download_media(
-                target_msg,
-                file=download_path,
-                progress_callback=progress_callback
+            speed = current_mb / elapsed if elapsed > 0 else 0
+            percent = (current / total) * 100
+            print(
+                f"\r⚡ {percent:.1f}% | {current_mb:.1f}/{total_mb_progress:.1f} MB @ {speed:.1f} MB/s    ",
+                end="", flush=True
             )
 
+        try:
+            # The magic: workers=8 enables parallel chunk downloading internally
+            result = await self.app.download_media(
+                message,
+                file_name=download_path,
+                progress=progress,
+                block=True,           # wait for completion
+                workers=workers       # parallel connections
+            )
             elapsed = time.time() - start_time
             avg_speed = total_mb / elapsed if elapsed > 0 else 0
-            print(f"\n✅ Downloaded successfully: {download_path} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
-            return download_path
-
-        except errors.DCError:
-            print(f"\n🔄 Target DC {dc_id} required master migration. Authenticating...")
-            # Fallback wrapper that handles internal handshake if first try gets a strict restriction
-            await asyncio.sleep(1)
-            await self.client.download_media(target_msg, file=download_path, progress_callback=progress_callback)
-            return download_path
+            print(f"\n✅ Downloaded: {result} ({total_mb:.1f}MB in {elapsed:.1f}s @ {avg_speed:.1f} MB/s)")
+            return result
+        except FloodWait as e:
+            print(f"\n⚠️ Flood wait: sleeping {e.value} seconds")
+            await asyncio.sleep(e.value)
+            # Retry once after waiting
+            return await self.download_file(filename, workers)
         except Exception as e:
             print(f"\n❌ Download failed: {e}")
             return None
-
-    async def disconnect(self):
-        if self.client:
-            await self.client.disconnect()
-            print("🔌 Disconnected from Telegram!")
