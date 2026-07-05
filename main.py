@@ -4,7 +4,7 @@ import nest_asyncio
 from config import settings
 from core.drive_manager import DriveManager
 from core.credentials_manager import CredentialsManager
-from core.pyrogram_downloader import PyrogramDownloader  # ← Pyrogram class import
+from core.telegram_downloader import PyrogramDownloader  # ← Pyrogram class import
 from core.terabox_uploader import TeraboxUploader
 
 # Apply nest_asyncio for Colab compatibility
