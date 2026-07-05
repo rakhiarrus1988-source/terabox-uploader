@@ -4,16 +4,16 @@ import nest_asyncio
 from config import settings
 from core.drive_manager import DriveManager
 from core.credentials_manager import CredentialsManager
-from core.telegram_downloader import TelegramDownloader
+from core.pyrogram_downloader import PyrogramDownloader  # ← Pyrogram class import
 from core.terabox_uploader import TeraboxUploader
 
 # Apply nest_asyncio for Colab compatibility
 nest_asyncio.apply()
 
 async def main():
-    print("="*50)
+    print("=" * 50)
     print("🚀 TELEGRAM → TERABOX UPLOADER")
-    print("="*50)
+    print("=" * 50)
 
     # Step 1: Mount Google Drive
     DriveManager.mount()
@@ -27,18 +27,18 @@ async def main():
         print("❌ Please enter a file name!")
         return
 
-    # Step 4: Download from Telegram
-    downloader = TelegramDownloader(api_id, api_hash, settings.SESSION_FILE)
+    # Step 4: Download from Telegram (using Pyrogram with 8 parallel workers)
+    downloader = PyrogramDownloader(api_id, api_hash, session_name=settings.SESSION_FILE)
     await downloader.connect()
 
-    downloaded_file = await downloader.download_file(file_name)
+    # 🚀 8 workers for high-speed parallel download
+    downloaded_file = await downloader.download_file(file_name, workers=8)
     await downloader.disconnect()
 
     if not downloaded_file:
         return
 
-    # Step 5: Upload to Terabox (Fixed line below)
-    # settings object se terabox ki email aur password pass kiya hai
+    # Step 5: Upload to Terabox
     uploader = TeraboxUploader(email=settings.TERABOX_EMAIL, password=settings.TERABOX_PASSWORD)
     uploader.login_with_cookies()
     result = uploader.upload_file(downloaded_file)
